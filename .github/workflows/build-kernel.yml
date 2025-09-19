@@ -1,0 +1,136 @@
+name: Build Linux Kernel
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+env:
+  KERNEL_VERSION: 6.12.42
+  STYX_BUILD: 13
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: arc-runner-set-styx
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libncurses-dev \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            wget \
+            xz-utils \
+            bc \
+            dwarves \
+            cpio \
+            liblz4-tool \
+            python3 \
+            git \
+            debhelper \
+            dh-python \
+            kmod \
+            rsync \
+            fakeroot \
+            libudev-dev \
+            libpci-dev \
+            liblzma-dev \
+            libzstd-dev
+
+      - name: Cache Linux kernel tarball
+        uses: actions/cache@v4
+        with:
+          path: linux-${{ env.KERNEL_VERSION }}.tar.xz
+          key: linux-kernel-${{ env.KERNEL_VERSION }}
+
+      - name: Download Linux kernel source
+        run: |
+          KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
+          KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz"
+          if [ ! -f "${KERNEL_TARBALL}" ]; then
+            wget "${KERNEL_URL}"
+          fi
+          tar -xf "${KERNEL_TARBALL}"
+
+      - name: Add debian packaging directory if missing
+        run: |
+          cd linux-${KERNEL_VERSION}
+          if [ ! -d debian ]; then
+            echo "Creating minimal debian/ packaging directory..."
+            mkdir -p debian
+          fi
+
+      - name: Create minimal debian changelog if missing
+        run: |
+          cd linux-${KERNEL_VERSION}
+          if [ ! -f debian/changelog ]; then
+            echo "Creating minimal debian/changelog..."
+            mkdir -p debian
+            DATE=$(date +%y%m%d%H%M)
+            DATE_R="$(date -R)"
+            if [ ! -f "$GITHUB_WORKSPACE/debian-changelog.template" ]; then
+              echo "ERROR: debian-changelog.template not found!" >&2
+              exit 1
+            fi
+            sed "s/{{DATE}}/$DATE/g; s/{{DATE_R}}/$DATE_R/g" $GITHUB_WORKSPACE/debian-changelog.template > debian/changelog
+          fi
+
+      - name: Configure the kernel
+        run: |
+          cp $GITHUB_WORKSPACE/x86_64_config linux-${KERNEL_VERSION}/.config
+          cd linux-${KERNEL_VERSION}
+          scripts/config --disable LOCALVERSION_AUTO
+          scripts/config --set-str LOCALVERSION ""
+          make olddefconfig
+
+      - name: Update debian changelog for custom version
+        run: |
+          cd linux-${KERNEL_VERSION}
+          sed -i "1s/([^)]*)/(${KERNEL_VERSION}-${STYX_BUILD}-styx)/" debian/changelog
+
+      - name: Initialize git repo in kernel source (need for debian packaging)
+        run: |
+          cd linux-${KERNEL_VERSION}
+          git init
+          git config user.email "ci@example.com"
+          git config user.name "CI"
+          git add .
+          git commit -m "init"
+
+      - name: Build kernel and generate .deb packages
+        run: |
+          cd linux-${KERNEL_VERSION}
+          # Ensure empty
+          echo "${KERNEL_VERSION}-${STYX_BUILD}-styx" > .scmversion
+          export KBUILD_BUILD_VERSION=""
+          export DEB_BUILD_OPTIONS="nocheck"
+          fakeroot make LOCALVERSION="-${STYX_BUILD}-styx" KDEB_PKGVERSION="${STYX_BUILD}" -j$(nproc) deb-pkg
+      - name: Copy postinst script for kernel package
+        run: |
+          cd linux-${KERNEL_VERSION}
+          for pkg in debian/*; do
+            if echo "$pkg" | grep -q '^debian/linux-image'; then
+              cp $GITHUB_WORKSPACE/postinst debian/postinst
+              chmod +x debian/postinst
+            fi
+          done
+
+      - name: Upload .deb packages to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.deb"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
