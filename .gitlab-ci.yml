@@ -1,0 +1,37 @@
+stages:
+  - deploy
+
+before_script:
+  - echo "nameserver 192.168.2.126" > /etc/resolv.conf
+  - cat /etc/resolv.conf
+  - ls -la
+  - ls -la .git
+
+deploy_to_github:
+  stage: deploy
+  image: alpine/git
+  # when: manual
+  script:
+    # Configurar el usuario de Git
+    - git rev-parse --is-shallow-repository
+    - git config --global user.name "GitLabCI"
+    - git config --global user.email "ci-bot@no.domain"
+    #- git for-each-ref --format='delete %(refname)' refs/pipelines/ refs/merge-requests/ | git update-ref --stdin
+    #- git fsck --full
+    - git remote add github https://oauth2:${GITHUB_STYX_TOKEN}@github.com/styx-firewall/styx-kernel.git
+    # - git checkout -B main
+    # - git push github --mirror --force --no-verify
+
+    # Crea un branch huérfano (sin historial)
+    - git checkout --orphan temp-branch
+
+    # Añade todos los archivos y haz un commit
+    - git add .
+    - git commit -m "Snapshot without history"
+
+    # Borra la rama main anterior y renombra la nueva
+    - git branch -D main || true
+    - git branch -m main
+
+    # Fuerza el push solo de la rama main
+    - git push github main --force --no-verify
