@@ -1,0 +1,225 @@
+name: Build Linux Kernel
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+env:
+  STYX_BUILD: 16
+  KERNEL_VERSION: 6.12.95
+  KERNEL_VARIANT: styx
+  SCCACHE_BUCKET: k8sbucket
+  SCCACHE_ENDPOINT: http://192.168.2.164:9000
+  SCCACHE_REGION: us-east-1
+  SCCACHE_S3_USE_SSL: "false"
+  AWS_ACCESS_KEY_ID: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test-sccache:
+    continue-on-error: true
+    runs-on: arc-runner-set-styx-2604
+    steps:
+      - name: Install sccache
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc g++
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-musl.tar.gz | tar -xz
+          sudo mv sccache-*/sccache /usr/local/bin/
+          sccache --version
+          rm -rf sccache-*/
+          sudo apt-get clean
+
+      - name: Test sccache
+        run: |
+          mkdir -p /tmp/sccache-wrappers
+          for cc in gcc g++; do
+            real="$(command -v $cc)"
+            printf '#!/bin/bash\nexec sccache %s "$@"\n' "$real" > /tmp/sccache-wrappers/$cc
+            chmod +x /tmp/sccache-wrappers/$cc
+          done
+          export PATH="/tmp/sccache-wrappers:$PATH"
+          echo 'int main(){return 0;}' > /tmp/test.c
+          echo "=== 1st compile ==="
+          gcc -c /tmp/test.c -o /tmp/test1.o
+          sccache --show-stats
+          echo "=== 2nd compile (should be cache hit) ==="
+          gcc -c /tmp/test.c -o /tmp/test2.o
+          sccache --show-stats
+
+  build:
+    needs: test-sccache
+    runs-on: arc-runner-set-styx-2604
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libncurses-dev \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            wget \
+            xz-utils \
+            bc \
+            dwarves \
+            cpio \
+            lz4 \
+            python3 \
+            git \
+            debhelper \
+            dh-python \
+            kmod \
+            rsync \
+            fakeroot \
+            libudev-dev \
+            libpci-dev \
+            liblzma-dev \
+            libzstd-dev \
+            pahole
+          sudo apt-get clean
+
+      - name: Install RustFS tools
+        run: |
+          sudo apt-get install -y awscli
+          curl -sL https://github.com/mozilla/sccache/releases/download/v0.8.1/sccache-v0.8.1-x86_64-unknown-linux-musl.tar.gz | tar -xz
+          sudo mv sccache-*/sccache /usr/local/bin/
+          sccache --version
+          rm -rf sccache-*/
+          sudo apt-get clean
+
+      - name: Download Linux kernel source
+        run: |
+          KERNEL_TARBALL="linux-${KERNEL_VERSION}.tar.xz"
+          KERNEL_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz"
+          if aws s3 --endpoint-url ${SCCACHE_ENDPOINT} --no-verify-ssl cp s3://${SCCACHE_BUCKET}/${KERNEL_TARBALL} . 2>/dev/null; then
+            echo "Tarball pulled from RustFS"
+          else
+            wget "${KERNEL_URL}"
+            aws s3 --endpoint-url ${SCCACHE_ENDPOINT} --no-verify-ssl cp ${KERNEL_TARBALL} s3://${SCCACHE_BUCKET}/${KERNEL_TARBALL}
+            echo "Tarball uploaded to RustFS"
+          fi
+          tar -xf "${KERNEL_TARBALL}"
+          rm -f "${KERNEL_TARBALL}"
+          echo "Tarball removed, free space: $(df -h / | tail -1 | awk '{print $4}')"
+
+      - name: Add debian packaging directory if missing
+        run: |
+          cd linux-${KERNEL_VERSION}
+          if [ ! -d debian ]; then
+            echo "Creating minimal debian/ packaging directory..."
+            mkdir -p debian
+          fi
+
+      - name: Create minimal debian changelog if missing
+        run: |
+          cd linux-${KERNEL_VERSION}
+          if [ ! -f debian/changelog ]; then
+            echo "Creating minimal debian/changelog..."
+            mkdir -p debian
+            DATE=$(date +%y%m%d%H%M)
+            DATE_R="$(date -R)"
+            if [ ! -f "$GITHUB_WORKSPACE/debian-changelog.template" ]; then
+              echo "ERROR: debian-changelog.template not found!" >&2
+              exit 1
+            fi
+            sed "s/{{DATE}}/$DATE/g; s/{{DATE_R}}/$DATE_R/g" $GITHUB_WORKSPACE/debian-changelog.template > debian/changelog
+          fi
+
+      - name: Configure the kernel
+        run: |
+          cp $GITHUB_WORKSPACE/x86_64_config linux-${KERNEL_VERSION}/.config
+          cd linux-${KERNEL_VERSION}
+          scripts/config --disable LOCALVERSION_AUTO
+          scripts/config --set-str LOCALVERSION ""
+          make olddefconfig
+
+      - name: Update debian changelog for custom version
+        run: |
+          cd linux-${KERNEL_VERSION}
+          sed -i "1s/([^)]*)/(${KERNEL_VERSION}-${STYX_BUILD}-${KERNEL_VARIANT})/" debian/changelog
+
+      - name: Initialize git repo in kernel source (need for debian packaging)
+        run: |
+          cd linux-${KERNEL_VERSION}
+          git init
+          git config user.email "ci@example.com"
+          git config user.name "CI"
+          git add .
+          git commit -q -m "init"
+
+      - name: Setup sccache wrappers
+        run: |
+          for cc in gcc g++ cc cpp; do
+            real="$(command -v $cc)"
+            printf '#!/bin/sh\nexec /usr/local/bin/sccache %s "$@"\n' "$real" | sudo tee /usr/local/bin/$cc > /dev/null
+            sudo chmod +x /usr/local/bin/$cc
+          done
+
+      - name: Build kernel and generate .deb packages
+        working-directory: linux-${{ env.KERNEL_VERSION }}
+        run: |
+          echo "${KERNEL_VERSION}-${STYX_BUILD}-${KERNEL_VARIANT}" > .scmversion
+          export KBUILD_BUILD_VERSION=""
+          export DEB_BUILD_OPTIONS="nocheck"
+          export DEB_BUILD_PROFILES="pkg.linux-upstream.nokerneldbg"
+          fakeroot make CC="sccache /usr/bin/gcc" HOSTCC="sccache /usr/bin/gcc" LOCALVERSION="-${STYX_BUILD}-${KERNEL_VARIANT}" KDEB_PKGVERSION="${STYX_BUILD}" -j$(($(nproc)-1)) bindeb-pkg || {
+            echo "::error::Kernel build failed"
+            exit 1
+          }
+          echo "::group::SCCache stats (after)"
+          sccache --show-stats
+          echo "::endgroup::"
+
+      - name: SSCache Stats (after)
+        run: |
+          sccache --show-stats
+
+      - name: Copy postinst script for kernel package
+        run: |
+          cd linux-${KERNEL_VERSION}
+          for pkg in debian/*; do
+            if echo "$pkg" | grep -q '^debian/linux-image'; then
+              cp $GITHUB_WORKSPACE/postinst debian/postinst
+              chmod +x debian/postinst
+            fi
+          done
+
+      - name: Verify -dbg package was skipped
+        run: |
+          ls -la ./*.deb
+          if ls ./*-dbg_*.deb 2>/dev/null; then
+            echo "::warning::dbg package was generated anyway, check DEB_BUILD_PROFILES"
+          else
+            echo "OK: dbg package correctly skipped"
+          fi
+
+      - name: Upload .deb packages to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: "*.deb"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete tag on failure
+        if: failure() && startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Deleting tag: $TAG_NAME"
+          curl -s -X DELETE \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG_NAME}" || true
