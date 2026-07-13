@@ -1,0 +1,45 @@
+variables:
+  STYX_BUILD: "6.12.95-17-styx"
+  BUILD: 2
+
+stages:
+  - deploy
+
+before_script:
+  - echo "nameserver 192.168.2.126" > /etc/resolv.conf
+  - cat /etc/resolv.conf
+  - ls -la
+  - ls -la .git
+
+deploy_to_github:
+  stage: deploy
+  image: alpine/git
+  # when: manual
+  script:
+    # Configure Git user
+    - git rev-parse --is-shallow-repository
+    - git config --global user.name "GitLabCI"
+    - git config --global user.email "ci-bot@no.domain"
+    #- git for-each-ref --format='delete %(refname)' refs/pipelines/ refs/merge-requests/ | git update-ref --stdin
+    #- git fsck --full
+    - git remote add github https://oauth2:${GITHUB_STYX_TOKEN}@github.com/styx-firewall/styx-kernel.git
+    # - git checkout -B main
+    # - git push github --mirror --force --no-verify
+
+    # Create orphan branch (no history)
+    - git checkout --orphan temp-branch
+
+    # Add all files and commit
+    - git add .
+    - git commit -m "Snapshot without history"
+
+    # Delete old main branch and rename new one
+    - git branch -D main || true
+    - git branch -m main
+
+    # Force push main branch only
+    - git push github main --force --no-verify
+
+    # Tag and push to trigger GitHub release workflow
+    - git tag ${STYX_BUILD}
+    - git push github ${STYX_BUILD} -f
