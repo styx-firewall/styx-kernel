@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  update-initramfs -u -k "$2" || true
+
+  # Cambiar permisos de System.map a 640
+  for f in /boot/System.map-*; do
+    if [ -f "$f" ]; then
+      chmod 640 "$f" || true
+    fi
+  done
+
+  # Restore STYX os-release if it was overwritten (e.g. by base-files upgrade)
+  if [ -f /var/lib/styx/configs/os-release ]; then
+    cp /var/lib/styx/configs/os-release /etc/os-release || true
+  fi
+
+  if command -v update-grub >/dev/null 2>&1; then
+    update-grub || true
+  elif command -v grub-mkconfig >/dev/null 2>&1; then
+    grub-mkconfig -o /boot/grub/grub.cfg || true
+  fi
+fi
+exit 0
