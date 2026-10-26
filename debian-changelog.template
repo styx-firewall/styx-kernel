@@ -1,0 +1,5 @@
+linux ({{KERNEL_VERSION}}-{{STYX_BUILD}}-styx) unstable; urgency=medium
+
+  * Custom kernel build
+
+ -- CI <ci@example.com>  {{DATE_R}}

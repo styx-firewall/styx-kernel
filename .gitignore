@@ -1,0 +1,6 @@
+linux-*
+*.deb
+.git
+findings
+k8s-cluster
+.kilo
